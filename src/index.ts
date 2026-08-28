@@ -39,6 +39,8 @@ export interface Config extends DetectorConfig {
   escalation_reasoning_effort: 'off' | 'low' | 'high' | 'max'
   /** 实时可见输出检测：累积多少字符后开始检测。 */
   stream_min_chars: number
+  /** 工具调用循环：同一 step 内同一工具调用超过该次数 → 判循环。 */
+  max_repeated_tool_calls: number
 }
 
 export const Config = z.object({
@@ -54,6 +56,7 @@ export const Config = z.object({
   line_repeat_min: z.number().default(10),
   line_repeat_count: z.number().default(2),
   stream_min_chars: z.number().default(200),
+  max_repeated_tool_calls: z.number().default(5),
   intervention: z.string().default('检测到重复推理，请停止循环，直接给出最终答案。'),
   escalation_reasoning_effort: z.union(['off', 'low', 'high', 'max']).default('low'),
 })
@@ -72,6 +75,8 @@ export function apply(ctx: Context, config: Config): void {
   const sessionToAgent = new Map<string, Agent>()
   // 当前 step 的可见 content 累积（key = `${agentId}:${turn}:${step}`）。
   const streamContent = new Map<string, string>()
+  // 当前 step 的工具调用计数（key = `${agentId}:${turn}:${step}:${toolName}`）。
+  const toolCalls = new Map<string, number>()
 
   // agent/request 是 waterfall：await next() 拿到默认 config，返回替换值。
   ctx.on('agent/request', async ({ agent, turn }, next) => {
@@ -92,15 +97,29 @@ export function apply(ctx: Context, config: Config): void {
     sessionToAgent.delete(agent.session.id)
   })
 
-  // 实时可见输出检测：累积 text-delta，检测重复。
+  // 实时可见输出检测：累积 text-delta 检测文本重复；统计 tool-call 检测工具调用循环。
   ctx.on('session/event', (session: Session, event: SessionEvent) => {
     if (!config.enabled) return
     if (event.type !== 'assistant/chunk') return
     const agent = sessionToAgent.get(session.id)
     if (!agent) return
     const chunk = event.data.chunk
-    if (chunk.type !== 'text-delta') return
     const { turn, step } = event.data
+
+    // 工具调用循环：同一 step 内同一工具反复调用（如 job_output × 300）。
+    if (chunk.type === 'tool-call-delta' && chunk.name) {
+      const tkey = `${agent.id}:${turn}:${step}:${chunk.name}`
+      const count = (toolCalls.get(tkey) ?? 0) + 1
+      toolCalls.set(tkey, count)
+      if (count >= config.max_repeated_tool_calls) {
+        toolCalls.delete(tkey)
+        intervene(ctx, agent, turn, `tool-call loop (${chunk.name} × ${count})`, retries, reduceEffort, config)
+      }
+      return
+    }
+
+    // 文本重复：累积 text-delta。
+    if (chunk.type !== 'text-delta') return
     const key = `${agent.id}:${turn}:${step}`
     const buf = (streamContent.get(key) ?? '') + chunk.text
     streamContent.set(key, buf)
