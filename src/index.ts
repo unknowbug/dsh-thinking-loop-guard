@@ -1,13 +1,14 @@
 /**
  * @dsh-external/dsh-thinking-loop-guard — 思维链循环检测与打断插件。
  *
- * 机制（turn 级，无中间代理）：
- * - 订阅 `agent/turn-stopping`（serial 事件，turn 即将关闭时触发）。
- * - 此时当前 turn 的 assistant 消息已落盘，reasoning 完整可读。
- * - 用 `agent.session.surface.nodes` 枚举模型可见消息，读最新 assistant 消息的
- *   reasoning/content 文本，跑 LoopDetector（移植自 ollama-loop-guard，MIT）。
- * - 命中循环 → `agent.steer()` 注入干预消息，机器重读 inbox 继续同一 turn 再跑一步。
- * - 按 turn 计数重试（key = `${agentId}:${turn}`），超过 max_retries 放弃，让 turn 正常结束。
+ * 机制（无中间代理）：
+ * 1. **实时可见输出检测**（核心）：订阅 `session/event` 的 `assistant/chunk`，累积当前
+ *    step 的可见 content（text-delta），实时检测重复。命中 → `agent.steer()` 打断。
+ *    这能抓到"tickticktick…"这类**单次输出内**的可见循环（turn-stopping 抓不到，
+ *    因为循环发生时 turn 还没结束）。
+ * 2. **turn 结束检测**：`agent/turn-stopping` 时读最新 assistant 消息的 reasoning，
+ *    检测思维链循环（单 think 串内）。
+ * 3. 按 turn 计数重试（key = `${agentId}:${turn}`），超过 max_retries 放弃。
  *
  * 升级干预（不关闭思维链）：
  * - 第一次：steer 一条干预消息。
@@ -24,6 +25,7 @@ import {
   type MessageSource,
 } from '@deepseek-ai/dsh-llm'
 import type { Agent } from '@deepseek-ai/dsh-agent'
+import type { Session, SessionEvent } from '@deepseek-ai/dsh-session'
 import z from 'schemastery'
 import { LoopDetector, type DetectorConfig } from './detector.ts'
 
@@ -35,6 +37,8 @@ export interface Config extends DetectorConfig {
   intervention: string
   /** 升级时把该 turn 后续请求的推理强度降到这个档位（思维链仍开启）。 */
   escalation_reasoning_effort: 'off' | 'low' | 'high' | 'max'
+  /** 实时可见输出检测：累积多少字符后开始检测。 */
+  stream_min_chars: number
 }
 
 export const Config = z.object({
@@ -49,6 +53,7 @@ export const Config = z.object({
   block_repeat_count: z.number().default(3),
   line_repeat_min: z.number().default(10),
   line_repeat_count: z.number().default(2),
+  stream_min_chars: z.number().default(200),
   intervention: z.string().default('检测到重复推理，请停止循环，直接给出最终答案。'),
   escalation_reasoning_effort: z.union(['off', 'low', 'high', 'max']).default('low'),
 })
@@ -59,14 +64,16 @@ const PLUGIN_SOURCE: MessageSource = { kind: 'plugin', plugin: 'dsh-thinking-loo
 const ESCALATION = '再次检测到重复推理：立即停止分析，直接给出最终答案。不要重新计算或重新分析，直接输出结论；若确实无法解决，请直接说明。'
 
 export function apply(ctx: Context, config: Config): void {
-  // 每个 turn 独立计数（key = `${agentId}:${turn}`），steer 后同一 turn 继续累加，
-  // 新 turn 自然归零；turn 关闭（未命中或放弃）时删除，map 只保留进行中的 turn。
+  // 每个 turn 独立计数（key = `${agentId}:${turn}`），steer 后同一 turn 继续累加。
   const retries = new Map<string, number>()
   // 已升级的 turn：后续请求降低推理强度（思维链仍开启）。
   const reduceEffort = new Set<string>()
+  // session.id -> agent 映射（session/event 是全局的，需反查 agent）。
+  const sessionToAgent = new Map<string, Agent>()
+  // 当前 step 的可见 content 累积（key = `${agentId}:${turn}:${step}`）。
+  const streamContent = new Map<string, string>()
 
   // agent/request 是 waterfall：await next() 拿到默认 config，返回替换值。
-  // 对已升级的 turn，把 reasoningEffort 降到配置档位（不关闭 thinking）。
   ctx.on('agent/request', async ({ agent, turn }, next) => {
     const key = `${agent.id}:${turn}`
     if (!reduceEffort.has(key)) return next()
@@ -77,6 +84,37 @@ export function apply(ctx: Context, config: Config): void {
     }
   })
 
+  // 建立 session -> agent 映射。
+  ctx.on('agent/created', ({ agent }) => {
+    sessionToAgent.set(agent.session.id, agent)
+  })
+  ctx.on('agent/disposed', ({ agent }) => {
+    sessionToAgent.delete(agent.session.id)
+  })
+
+  // 实时可见输出检测：累积 text-delta，检测重复。
+  ctx.on('session/event', (session: Session, event: SessionEvent) => {
+    if (!config.enabled) return
+    if (event.type !== 'assistant/chunk') return
+    const agent = sessionToAgent.get(session.id)
+    if (!agent) return
+    const chunk = event.data.chunk
+    if (chunk.type !== 'text-delta') return
+    const { turn, step } = event.data
+    const key = `${agent.id}:${turn}:${step}`
+    const buf = (streamContent.get(key) ?? '') + chunk.text
+    streamContent.set(key, buf)
+    if (buf.length < config.stream_min_chars) return
+
+    const detector = new LoopDetector(config)
+    const hit = detector.checkContent(buf)
+    if (!hit) return
+    // 命中 → 打断。清空累积，避免重复触发。
+    streamContent.delete(key)
+    intervene(ctx, agent, turn, hit, retries, reduceEffort, config)
+  })
+
+  // turn 结束检测：读最新 assistant 消息的 reasoning（单 think 串）。
   ctx.on('agent/turn-stopping', async ({ agent, turn }) => {
     if (!config.enabled) return
     const latest = latestAssistantMessage(agent, turn)
@@ -92,41 +130,40 @@ export function apply(ctx: Context, config: Config): void {
     ctx.logger.debug(
       `[thinking-loop-guard] turn=${turn} reasoning=${latest.reasoning.length} content=${latest.content.length} reason=${reason ?? 'none'}`,
     )
-
-    const key = `${agent.id}:${turn}`
-    if (!reason) {
-      retries.delete(key)
-      reduceEffort.delete(key)
-      return
-    }
-
-    const attempts = retries.get(key) ?? 0
-    if (attempts >= config.max_retries) {
-      retries.delete(key)
-      reduceEffort.delete(key)
-      ctx.logger.warn(`[thinking-loop-guard] give up after ${attempts} retries (${reason})`)
-      return
-    }
-
-    retries.set(key, attempts + 1)
-    // 第二次及以后升级：降低该 turn 后续请求的推理强度（思维链仍开启）。
-    if (attempts >= 1) reduceEffort.add(key)
-    const text = attempts === 0 ? config.intervention : ESCALATION
-    ctx.logger.info(`[thinking-loop-guard] ${reason} -> steer (attempt ${attempts + 1}/${config.max_retries})`)
-    agent.steer(createUserMessage({ content: [{ type: 'text', text }], source: PLUGIN_SOURCE }))
+    if (reason) intervene(ctx, agent, turn, reason, retries, reduceEffort, config)
   })
+}
+
+/** 命中循环 → 按重试计数 steer 干预（或放弃）。 */
+function intervene(
+  ctx: Context,
+  agent: Agent,
+  turn: number,
+  reason: string,
+  retries: Map<string, number>,
+  reduceEffort: Set<string>,
+  config: Config,
+): void {
+  const key = `${agent.id}:${turn}`
+  const attempts = retries.get(key) ?? 0
+  if (attempts >= config.max_retries) {
+    retries.delete(key)
+    reduceEffort.delete(key)
+    ctx.logger.warn(`[thinking-loop-guard] give up after ${attempts} retries (${reason})`)
+    return
+  }
+  retries.set(key, attempts + 1)
+  // 第二次及以后升级：降低该 turn 后续请求的推理强度（思维链仍开启）。
+  if (attempts >= 1) reduceEffort.add(key)
+  const text = attempts === 0 ? config.intervention : ESCALATION
+  ctx.logger.info(`[thinking-loop-guard] ${reason} -> steer (attempt ${attempts + 1}/${config.max_retries})`)
+  agent.steer(createUserMessage({ content: [{ type: 'text', text }], source: PLUGIN_SOURCE }))
 }
 
 /**
  * 取当前 turn 最新 assistant 消息的 reasoning/content 文本。
- *
- * 关键：循环几乎都发生在**单个 think 串（单条 assistant 消息）内**，所以只检测最新一条
- * 消息的 reasoning 即可。不要累加整个 turn——那会把正常的多步思考（等待后台任务、汇报）
- * 误判成循环（实测误伤）。
- *
- * 用 surface.nodes 枚举模型可见顺序（倒序找最新），直接读 event.data.message
- * （而非 deriveEventMessage，因为空 content 的 assistant 消息会被投影为 null，
- * 而循环检测恰恰需要空 content 时的 reasoning）。
+ * 循环几乎都发生在单个 think 串（单条 assistant 消息）内，所以只检测最新一条。
+ * 用 surface.nodes 枚举模型可见顺序（倒序找最新），直接读 event.data.message。
  */
 function latestAssistantMessage(
   agent: Agent,
