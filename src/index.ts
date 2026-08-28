@@ -183,9 +183,9 @@ function intervene(
   } else {
     // 第二次及以后：硬打断。agent.steer() 无法中断正在进行的流式输出（模型会一直
     // 输出到 max-tokens 截断），必须 agent.cancel() 立即中断当前 turn。
-    // 先注入干预消息（保留在 inbox，cancel 后下一 turn 会消费），再 cancel。
+    // 先注入干预消息，再 cancel（keepInbox: true 保留干预消息，下一 turn 消费）。
     agent.steer(createUserMessage({ content: [{ type: 'text', text }], source: PLUGIN_SOURCE }))
-    agent.cancel({ kind: 'hook', reason: 'thinking-loop-guard' })
+    agent.cancel({ kind: 'hook', reason: 'thinking-loop-guard' }, { keepInbox: true })
   }
 }
 
