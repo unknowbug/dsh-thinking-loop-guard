@@ -47,7 +47,7 @@ export const Config = z.object({
   repeat_span_min: z.number().default(24),
   content_repeat_span_min: z.number().default(100),
   block_repeat_min: z.number().default(100),
-  block_repeat_count: z.number().default(3),
+  block_repeat_count: z.number().default(2),
   intervention: z.string().default('检测到重复推理，请停止循环，直接给出最终答案。'),
   escalation_reasoning_effort: z.union(['off', 'low', 'high', 'max']).default('low'),
 })
@@ -87,6 +87,9 @@ export function apply(ctx: Context, config: Config): void {
     )?.time
     const elapsed = turnStart === undefined ? 0 : (Date.now() - turnStart) / 1000
     const reason = hit ?? detector.checkElapsed(elapsed, content.length > 0)
+    ctx.logger.debug(
+      `[thinking-loop-guard] turn=${turn} reasoning=${reasoning.length} content=${content.length} reason=${reason ?? 'none'}`,
+    )
 
     const key = `${agent.id}:${turn}`
     if (!reason) {

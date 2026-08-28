@@ -15,7 +15,7 @@ const cfg: DetectorConfig = {
   max_total_sec: 120,
   max_reasoning_sec: 60,
   block_repeat_min: 100,
-  block_repeat_count: 3,
+  block_repeat_count: 2,
 }
 
 describe('LoopDetector', () => {
@@ -86,5 +86,13 @@ describe('LoopDetector', () => {
     const single = text.slice(0, text.indexOf('等等，我重新算一下。单 chunk finalDensity 0.05μs/pt，8 chunk 4.32μs/pt。但纯树 0.93μs/pt 1 和 8 chunk 一样。', 1))
     const det = new LoopDetector(cfg)
     expect(det.checkReasoning(single)).toBeNull()
+  })
+
+  it('detects a single-think-string sentence-cycle loop', () => {
+    // A loop of ~8 distinct sentences cycling within ONE think string.
+    const here = dirname(fileURLToPath(import.meta.url))
+    const text = readFileSync(join(here, 'real_loop3.txt'), 'utf8')
+    const det = new LoopDetector(cfg)
+    expect(det.checkReasoning(text)).toBe('reasoning repetition')
   })
 })

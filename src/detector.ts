@@ -10,9 +10,10 @@
  * 1. Literal long-repeat (reference): a unit of 8–200 chars repeated 2+ more times.
  * 2. Punctuation-variant repeat (reference): the same unit ≥3× with interleaved punctuation.
  * 3. **Long-range block repeat (added for DSH)**: a substantial normalized window
- *    (default 100 chars) appearing ≥3 times anywhere in the reasoning. The reference's
- *    tight-loop heuristics miss the real-world "re-analyze the same thing from scratch"
- *    loop, where a large reasoning block recurs verbatim with different text in between.
+ *    (default 100 chars) appearing ≥`block_repeat_count` (default 2) times anywhere in
+ *    the reasoning. The reference's tight-loop heuristics miss the real-world
+ *    "re-analyze the same thing from scratch" loop, where a large reasoning block recurs
+ *    verbatim with different text in between.
  */
 
 /** Detection thresholds (a subset of the plugin config). */
