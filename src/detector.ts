@@ -10,10 +10,13 @@
  * 1. Literal long-repeat (reference): a unit of 8–200 chars repeated 2+ more times.
  * 2. Punctuation-variant repeat (reference): the same unit ≥3× with interleaved punctuation.
  * 3. **Long-range block repeat (added for DSH)**: a substantial normalized window
- *    (default 100 chars) appearing ≥`block_repeat_count` (default 2) times anywhere in
+ *    (default 100 chars) appearing ≥`block_repeat_count` (default 3) times anywhere in
  *    the reasoning. The reference's tight-loop heuristics miss the real-world
  *    "re-analyze the same thing from scratch" loop, where a large reasoning block recurs
  *    verbatim with different text in between.
+ * 4. **Line repeat (added for DSH)**: a normalized line (≥`line_repeat_min` chars) appearing
+ *    ≥`line_repeat_count` times. Catches single-think-string sentence-cycle loops where the
+ *    same sentence recurs verbatim (e.g. "让我先配置 seed + beard.dump，然后跑 gradle runServer").
  */
 
 /** Detection thresholds (a subset of the plugin config). */
@@ -32,6 +35,10 @@ export interface DetectorConfig {
   block_repeat_min: number
   /** How many times a block window must recur to flag long-range repetition. */
   block_repeat_count: number
+  /** Minimum normalized line length (chars) for line-repeat detection. */
+  line_repeat_min: number
+  /** How many times a line must recur to flag line repetition. */
+  line_repeat_count: number
 }
 
 /** Why a turn was judged to be looping. */
@@ -57,6 +64,7 @@ export class LoopDetector {
     if (text.length > this.cfg.reasoning_char_limit) return 'reasoning overflow'
     if (this.repeat(text, this.cfg.repeat_span_min)) return 'reasoning repetition'
     if (this.blockRepeat(text)) return 'reasoning repetition'
+    if (this.lineRepeat(text)) return 'reasoning repetition'
     return null
   }
 
@@ -113,6 +121,27 @@ export class LoopDetector {
       const c = (seen.get(window) ?? 0) + 1
       if (c >= count) return true
       seen.set(window, c)
+    }
+    return false
+  }
+
+  /**
+   * Line-repeat detection: split into lines, normalize each, and flag when a
+   * line (≥`line_repeat_min` chars) appears ≥`line_repeat_count` times.
+   * Catches single-think-string sentence-cycle loops where the same sentence
+   * recurs verbatim (the block-window rule can miss these when the cycle has
+   * only 2 recurrences or the window straddles sentence boundaries).
+   */
+  private lineRepeat(text: string): boolean {
+    const { line_repeat_min: min, line_repeat_count: count } = this.cfg
+    if (min <= 0 || count < 2) return false
+    const seen = new Map<string, number>()
+    for (const raw of text.split(/\n+/)) {
+      const line = raw.replace(STRIP, '')
+      if (line.length < min) continue
+      const c = (seen.get(line) ?? 0) + 1
+      if (c >= count) return true
+      seen.set(line, c)
     }
     return false
   }

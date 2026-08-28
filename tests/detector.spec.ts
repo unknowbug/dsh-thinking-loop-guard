@@ -15,7 +15,9 @@ const cfg: DetectorConfig = {
   max_total_sec: 120,
   max_reasoning_sec: 60,
   block_repeat_min: 100,
-  block_repeat_count: 2,
+  block_repeat_count: 3,
+  line_repeat_min: 10,
+  line_repeat_count: 2,
 }
 
 describe('LoopDetector', () => {
@@ -94,5 +96,26 @@ describe('LoopDetector', () => {
     const text = readFileSync(join(here, 'real_loop3.txt'), 'utf8')
     const det = new LoopDetector(cfg)
     expect(det.checkReasoning(text)).toBe('reasoning repetition')
+  })
+
+  it('detects line-level repetition (same sentence recurs verbatim)', () => {
+    // A single think string where one sentence recurs verbatim — the line-repeat rule.
+    const text = '让我先配置 seed + beard.dump，然后跑 gradle runServer。\n'
+      + '考虑到这是大工程，让我先改 level-seed。\n'
+      + '让我先配置 seed + beard.dump，然后跑 gradle runServer。\n'
+      + '但需要找含结构区域。\n'
+      + '让我先配置 seed + beard.dump，然后跑 gradle runServer。'
+    const det = new LoopDetector(cfg)
+    expect(det.checkReasoning(text)).toBe('reasoning repetition')
+  })
+
+  it('does not flag a normal multi-line analysis', () => {
+    // A normal analysis with no repeated lines must not be flagged.
+    const text = '用户要求解释天空为什么是蓝色的。\n'
+      + '这涉及瑞利散射：大气中的分子与阳光相互作用。\n'
+      + '波长较短的蓝光被散射得最多，因此从地面看天空呈现蓝色。\n'
+      + '需要解释得简单直接，避免复杂术语。'
+    const det = new LoopDetector(cfg)
+    expect(det.checkReasoning(text)).toBeNull()
   })
 })
