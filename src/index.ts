@@ -175,18 +175,14 @@ function intervene(
   // 第二次及以后升级：降低该 turn 后续请求的推理强度（思维链仍开启）。
   if (attempts >= 1) reduceEffort.add(key)
   const text = attempts === 0 ? config.intervention : ESCALATION
-  ctx.logger.info(`[thinking-loop-guard] ${reason} -> ${attempts === 0 ? 'steer' : 'cancel'} (attempt ${attempts + 1}/${config.max_retries})`)
+  ctx.logger.info(`[thinking-loop-guard] ${reason} -> cancel (attempt ${attempts + 1}/${config.max_retries})`)
 
-  if (attempts === 0) {
-    // 第一次：温和 steer，给模型一次机会自己收尾。
-    agent.steer(createUserMessage({ content: [{ type: 'text', text }], source: PLUGIN_SOURCE }))
-  } else {
-    // 第二次及以后：硬打断。agent.steer() 无法中断正在进行的流式输出（模型会一直
-    // 输出到 max-tokens 截断），必须 agent.cancel() 立即中断当前 turn。
-    // 先注入干预消息，再 cancel（keepInbox: true 保留干预消息，下一 turn 消费）。
-    agent.steer(createUserMessage({ content: [{ type: 'text', text }], source: PLUGIN_SOURCE }))
-    agent.cancel({ kind: 'hook', reason: 'thinking-loop-guard' }, { keepInbox: true })
-  }
+  // 硬打断：agent.steer() 无法中断正在进行的流式输出——模型在流式输出中不会停下来
+  // 读 inbox 的 steering 消息，会一直输出到 max-tokens 截断（实测 turn 61 step 12 烧了
+  // 205 秒）。必须 agent.cancel() 立即中断当前 turn。
+  // 先注入干预消息，再 cancel（keepInbox: true 保留干预消息，下一 turn 消费）。
+  agent.steer(createUserMessage({ content: [{ type: 'text', text }], source: PLUGIN_SOURCE }))
+  agent.cancel({ kind: 'hook', reason: 'thinking-loop-guard' }, { keepInbox: true })
 }
 
 /**
