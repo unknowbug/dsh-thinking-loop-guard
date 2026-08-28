@@ -22,9 +22,9 @@ import {
   createUserMessage,
   ReasoningEffortId,
   type MessageSource,
-  type ReasoningEffortId as ReasoningEffortIdType,
 } from '@deepseek-ai/dsh-llm'
 import type { Agent } from '@deepseek-ai/dsh-agent'
+import type { SessionEvent } from '@deepseek-ai/dsh-session'
 import z from 'schemastery'
 import { LoopDetector, type DetectorConfig } from './detector.ts'
 
@@ -78,16 +78,15 @@ export function apply(ctx: Context, config: Config): void {
 
   ctx.on('agent/turn-stopping', async ({ agent, turn }) => {
     if (!config.enabled) return
-    const latest = latestAssistantMessage(agent, turn)
-    if (!latest) return
+    const { reasoning, content } = accumulateTurnText(agent.session.events, agent.session.surface.nodes, turn)
 
     const detector = new LoopDetector(config)
-    const hit = detector.checkReasoning(latest.reasoning) ?? detector.checkContent(latest.content)
+    const hit = detector.checkReasoning(reasoning) ?? detector.checkContent(content)
     const turnStart = agent.session.events.findLast(
       e => e.type === 'turn/start' && e.data.turn === turn,
     )?.time
     const elapsed = turnStart === undefined ? 0 : (Date.now() - turnStart) / 1000
-    const reason = hit ?? detector.checkElapsed(elapsed, latest.content.length > 0)
+    const reason = hit ?? detector.checkElapsed(elapsed, content.length > 0)
 
     const key = `${agent.id}:${turn}`
     if (!reason) {
@@ -114,30 +113,33 @@ export function apply(ctx: Context, config: Config): void {
 }
 
 /**
- * 取当前 turn 最新 assistant 消息的 reasoning/content 文本。
- * 用 surface.nodes 枚举模型可见顺序（倒序找最新），直接读 event.data.message
- * （而非 deriveEventMessage，因为空 content 的 assistant 消息会被投影为 null，
- * 而循环检测恰恰需要空 content 时的 reasoning）。
+ * 累加当前 turn 内所有 assistant 消息的 reasoning/content 文本。
+ *
+ * 关键：循环常被拆成多个 step/assistant 消息（每条只含一个循环周期），若只读最新一条，
+ * 单周期内每句只出现一次，`blockRepeat`（需同文本内 100 字符窗口出现 ≥3 次）抓不到。
+ * 累加整个 turn 的 reasoning 后，跨 step 的重复就可见了。
+ *
+ * 用 surface.nodes 枚举模型可见顺序，直接读 event.data.message（而非 deriveEventMessage，
+ * 因为空 content 的 assistant 消息会被投影为 null，而循环检测恰恰需要空 content 时的 reasoning）。
+ * reasoning 截断到 reasoningCap（默认 20000）尾部，保持有界且聚焦最近循环。
  */
-function latestAssistantMessage(
-  agent: Agent,
+export function accumulateTurnText(
+  events: readonly SessionEvent[],
+  surfaceNodes: readonly number[],
   turn: number,
-): { reasoning: string; content: string } | null {
-  const events = agent.session.events
-  for (const seq of [...agent.session.surface.nodes].reverse()) {
+  reasoningCap = 20000,
+): { reasoning: string; content: string } {
+  let reasoning = ''
+  let content = ''
+  for (const seq of surfaceNodes) {
     const event = events[seq]
     if (event?.type !== 'assistant/message') continue
     if (event.data.turn !== turn) continue
-    const message = event.data.message
-    const reasoning = message.content
-      .filter((b): b is Extract<typeof b, { type: 'reasoning' }> => b.type === 'reasoning')
-      .map(b => b.text)
-      .join('')
-    const content = message.content
-      .filter((b): b is Extract<typeof b, { type: 'text' }> => b.type === 'text')
-      .map(b => b.text)
-      .join('')
-    return { reasoning, content }
+    for (const block of event.data.message.content) {
+      if (block.type === 'reasoning') reasoning += block.text
+      else if (block.type === 'text') content += block.text
+    }
   }
-  return null
+  if (reasoning.length > reasoningCap) reasoning = reasoning.slice(-reasoningCap)
+  return { reasoning, content }
 }
