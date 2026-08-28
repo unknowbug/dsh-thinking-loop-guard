@@ -21,7 +21,6 @@
 import type { Context } from 'cordis'
 import {
   createUserMessage,
-  ReasoningEffortId,
   type MessageSource,
 } from '@deepseek-ai/dsh-llm'
 import type { Agent } from '@deepseek-ai/dsh-agent'
@@ -35,8 +34,6 @@ export interface Config extends DetectorConfig {
   enabled: boolean
   max_retries: number
   intervention: string
-  /** 升级时把该 turn 后续请求的推理强度降到这个档位（思维链仍开启）。 */
-  escalation_reasoning_effort: 'off' | 'low' | 'high' | 'max'
   /** 实时可见输出检测：累积多少字符后开始检测。 */
   stream_min_chars: number
   /** 工具调用循环：同一 step 内同一工具调用超过该次数 → 判循环。 */
@@ -58,7 +55,6 @@ export const Config = z.object({
   stream_min_chars: z.number().default(200),
   max_repeated_tool_calls: z.number().default(5),
   intervention: z.string().default('检测到重复推理，请停止循环，直接给出最终答案。'),
-  escalation_reasoning_effort: z.union(['off', 'low', 'high', 'max']).default('low'),
 })
 
 const PLUGIN_SOURCE: MessageSource = { kind: 'plugin', plugin: 'dsh-thinking-loop-guard' }
@@ -69,25 +65,12 @@ const ESCALATION = '再次检测到重复推理：立即停止分析，直接给
 export function apply(ctx: Context, config: Config): void {
   // 每个 turn 独立计数（key = `${agentId}:${turn}`），steer 后同一 turn 继续累加。
   const retries = new Map<string, number>()
-  // 已升级的 turn：后续请求降低推理强度（思维链仍开启）。
-  const reduceEffort = new Set<string>()
   // session.id -> agent 映射（session/event 是全局的，需反查 agent）。
   const sessionToAgent = new Map<string, Agent>()
   // 当前 step 的可见 content 累积（key = `${agentId}:${turn}:${step}`）。
   const streamContent = new Map<string, string>()
   // 当前 step 的工具调用计数（key = `${agentId}:${turn}:${step}:${toolName}`）。
   const toolCalls = new Map<string, number>()
-
-  // agent/request 是 waterfall：await next() 拿到默认 config，返回替换值。
-  ctx.on('agent/request', async ({ agent, turn }, next) => {
-    const key = `${agent.id}:${turn}`
-    if (!reduceEffort.has(key)) return next()
-    const cfg = await next()
-    return {
-      ...cfg,
-      reasoningEffort: ReasoningEffortId(config.escalation_reasoning_effort),
-    }
-  })
 
   // 建立 session -> agent 映射。
   ctx.on('agent/created', ({ agent }) => {
@@ -113,7 +96,7 @@ export function apply(ctx: Context, config: Config): void {
       toolCalls.set(tkey, count)
       if (count >= config.max_repeated_tool_calls) {
         toolCalls.delete(tkey)
-        intervene(ctx, agent, turn, `tool-call loop (${chunk.name} × ${count})`, retries, reduceEffort, config)
+        intervene(ctx, agent, turn, `tool-call loop (${chunk.name} × ${count})`, retries, config)
       }
       return
     }
@@ -130,7 +113,7 @@ export function apply(ctx: Context, config: Config): void {
     if (!hit) return
     // 命中 → 打断。清空累积，避免重复触发。
     streamContent.delete(key)
-    intervene(ctx, agent, turn, hit, retries, reduceEffort, config)
+    intervene(ctx, agent, turn, hit, retries, config)
   })
 
   // turn 结束检测：读最新 assistant 消息的 reasoning（单 think 串）。
@@ -149,7 +132,7 @@ export function apply(ctx: Context, config: Config): void {
     ctx.logger.debug(
       `[thinking-loop-guard] turn=${turn} reasoning=${latest.reasoning.length} content=${latest.content.length} reason=${reason ?? 'none'}`,
     )
-    if (reason) intervene(ctx, agent, turn, reason, retries, reduceEffort, config)
+    if (reason) intervene(ctx, agent, turn, reason, retries, config)
   })
 }
 
@@ -160,20 +143,16 @@ function intervene(
   turn: number,
   reason: string,
   retries: Map<string, number>,
-  reduceEffort: Set<string>,
   config: Config,
 ): void {
   const key = `${agent.id}:${turn}`
   const attempts = retries.get(key) ?? 0
   if (attempts >= config.max_retries) {
     retries.delete(key)
-    reduceEffort.delete(key)
     ctx.logger.warn(`[thinking-loop-guard] give up after ${attempts} retries (${reason})`)
     return
   }
   retries.set(key, attempts + 1)
-  // 第二次及以后升级：降低该 turn 后续请求的推理强度（思维链仍开启）。
-  if (attempts >= 1) reduceEffort.add(key)
   const text = attempts === 0 ? config.intervention : ESCALATION
   ctx.logger.info(`[thinking-loop-guard] ${reason} -> cancel (attempt ${attempts + 1}/${config.max_retries})`)
 
