@@ -97,16 +97,17 @@ export function apply(ctx: Context, config: Config): void {
     }
   })
 
-  // turn 结束检测：读最新 assistant 消息的 reasoning（单 think 串）。
-  // 插件版只负责**长文本 loop**（reasoning 里的长程块重复）——短文本循环（content/tick）
-  // 由本地代理（dsh_loop_guard.py）在 HTTP 层处理，插件版不重复检测 content。
+  // turn 结束检测：读最新 assistant 消息的 reasoning + content。
+  // 插件版负责**长文本 loop**（reasoning 或 content 里的长程块重复）——代理版抓不到
+  // 长文本 content loop（它只抓短文本 content repetition 如 tick），所以插件版同时
+  // 检测 reasoning 和 content 的长文本重复。
   ctx.on('agent/turn-stopping', async ({ agent, turn }) => {
     if (!config.enabled) return
     const latest = latestAssistantMessage(agent, turn)
     if (!latest) return
 
     const detector = new LoopDetector(config)
-    const hit = detector.checkReasoning(latest.reasoning)
+    const hit = detector.checkReasoning(latest.reasoning) ?? detector.checkContent(latest.content)
     const turnStart = agent.session.events.findLast(
       e => e.type === 'turn/start' && e.data.turn === turn,
     )?.time
